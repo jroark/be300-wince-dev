@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# Compile C for the Casio BE-300 (Windows CE 3.0, MIPS II, no FPU) with
+# Homebrew clang against the Casio SDK headers in sdk/Include.
+# Usage: be300-cc [clang args...] -c foo.c -o foo.o
+set -euo pipefail
+
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+llvm="${BE300_LLVM:-$(brew --prefix llvm 2>/dev/null || echo /opt/homebrew/opt/llvm)}/bin"
+sdk="${BE300_SDK:-$root/sdk}"
+
+[[ -d "$sdk/Include" ]] || { echo "be300-cc: $sdk/Include missing; run ./setup.sh" >&2; exit 1; }
+
+# Header search order: Casio BE-300 SDK, then clang's builtin headers
+# (stddef.h, stdint.h, stdbool.h, which the Casio SDK lacks), then the
+# H/PC Pro 3.0 SDK headers from the eVC ISO, if setup.sh extracted them.
+extra=()
+[[ -d "$sdk/hpc/Include" ]] && extra+=(-idirafter "$sdk/hpc/Include")
+
+# MIPS16SUPPORT selects kfuncs.h's __emit-based DebugBreak declaration;
+# its default branch declares `__asm` as a function, which clang rejects.
+# DebugBreak itself comes from rt/debugbreak.c.
+exec "$llvm/clang" \
+    --target=mipsel-windows-msvc -march=mips2 -msoft-float \
+    -mno-abicalls -fno-pic -G0 \
+    -fms-extensions -fno-stack-protector -fno-asynchronous-unwind-tables \
+    -nostdlibinc -isystem "$sdk/Include" ${extra[@]+"${extra[@]}"} \
+    -D_WIN32_WCE=300 -DUNDER_CE=300 -DWCE_PLATFORM_CASIO_BE300 \
+    -DMIPS -D_MIPS_ -DMIPS16SUPPORT -DUNICODE -D_UNICODE \
+    -Wno-ignored-pragma-intrinsic -Wno-pragma-pack -Wno-microsoft-anon-tag \
+    "$@"

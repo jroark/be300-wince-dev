@@ -1,0 +1,984 @@
+#!/usr/bin/env python3
+"""
+be300-ld: a minimal PE linker for Windows CE 3.0 MIPS (R4000 COFF) executables.
+
+lld-link understands MIPS COFF objects and import libraries but cannot apply
+MIPS relocations, so this links clang's mipsel-windows-msvc objects into a
+Casio BE-300 executable itself. Output matches what eVC3's LINK.EXE produces
+for the SDK samples: image base 0x10000, relocations stripped, subsystem
+WINDOWS_CE_GUI 3.00, imports through a writable .idata section.
+
+Supported input:
+  - COFF objects (machine R4000 or UNKNOWN)
+  - .lib archives holding COFF objects and/or short import members
+  - .res files (compiled resources) via --res
+
+Relocations: ABSOLUTE, REFHALF, REFWORD, JMPADDR, REFHI+PAIR, REFLO,
+REFWORDNB, SECTION, SECREL. GPREL/LITERAL are rejected (build with -G0).
+"""
+
+import argparse
+import os
+import struct
+import sys
+
+IMAGE_FILE_MACHINE_UNKNOWN = 0x0
+IMAGE_FILE_MACHINE_R4000 = 0x166
+
+SCN_CNT_CODE = 0x20
+SCN_CNT_INIT = 0x40
+SCN_CNT_UNINIT = 0x80
+SCN_LNK_INFO = 0x200
+SCN_LNK_REMOVE = 0x800
+SCN_LNK_COMDAT = 0x1000
+SCN_MEM_DISCARDABLE = 0x02000000
+SCN_MEM_EXECUTE = 0x20000000
+SCN_MEM_READ = 0x40000000
+SCN_MEM_WRITE = 0x80000000
+
+SYM_CLASS_EXTERNAL = 2
+SYM_CLASS_STATIC = 3
+SYM_CLASS_LABEL = 6
+SYM_CLASS_WEAK_EXTERNAL = 105
+
+R_ABSOLUTE = 0x00
+R_REFHALF = 0x01
+R_REFWORD = 0x02
+R_JMPADDR = 0x03
+R_REFHI = 0x04
+R_REFLO = 0x05
+R_GPREL = 0x06
+R_LITERAL = 0x07
+R_SECTION = 0x0A
+R_SECREL = 0x0B
+R_REFWORDNB = 0x22
+R_PAIR = 0x25
+
+SECTION_ALIGN = 0x1000
+FILE_ALIGN = 0x200
+
+
+class LinkError(Exception):
+    pass
+
+
+def align(v, a):
+    return (v + a - 1) & ~(a - 1)
+
+
+def cstr(b):
+    n = b.find(b"\0")
+    return (b if n < 0 else b[:n]).decode("latin-1")
+
+
+# ---------------------------------------------------------------------------
+# Input model
+# ---------------------------------------------------------------------------
+
+class InSection:
+    def __init__(self, obj, index, name, flags, data, relocs, size):
+        self.obj = obj
+        self.index = index          # 1-based section number in the object
+        self.name = name
+        self.flags = flags
+        self.data = data            # bytes, or None for uninitialized
+        self.relocs = relocs        # list of (offset, symidx, type)
+        self.size = size
+        self.out = None             # OutSection
+        self.offset = 0             # offset inside OutSection
+        self.live = True
+        self.comdat_sel = 0
+        self.assoc = 0
+
+    @property
+    def alignment(self):
+        a = (self.flags >> 20) & 0xF
+        return 1 << (a - 1) if a else 16
+
+    def rva(self):
+        return self.out.rva + self.offset
+
+
+class Symbol:
+    """A global symbol shared by all inputs."""
+
+    def __init__(self, name):
+        self.name = name
+        self.section = None         # InSection
+        self.value = 0
+        self.absolute = None        # absolute value when defined in section -1
+        self.common = 0             # size, for COMMON symbols
+        self.imp = None             # Import, for __imp_ symbols
+        self.thunk = None           # Import, for code import thunks
+        self.synthetic = None       # callable returning an RVA
+        self.weak_default = None    # Symbol name for weak externals
+
+    def defined(self):
+        return (self.section is not None or self.absolute is not None or
+                self.common or self.imp is not None or
+                self.thunk is not None or self.synthetic is not None)
+
+
+class Import:
+    def __init__(self, dll, name, ordinal, by_ordinal):
+        self.dll = dll
+        self.name = name            # import name (for by-name imports)
+        self.ordinal = ordinal
+        self.by_ordinal = by_ordinal
+        self.iat_rva = 0
+        self.thunk_rva = 0
+        self.need_thunk = False
+
+
+class ObjFile:
+    def __init__(self, path, data):
+        self.path = path
+        self.sections = {}          # index -> InSection
+        self.symbols = []           # index -> (name, value, secnum, class, aux) or None
+        self.drectve = ""
+        self.parse(data)
+
+    def parse(self, data):
+        (machine, nsec, _ts, symptr, nsym, opthdr, _ch) = struct.unpack_from(
+            "<HHIIIHH", data, 0)
+        if machine not in (IMAGE_FILE_MACHINE_R4000, IMAGE_FILE_MACHINE_UNKNOWN):
+            raise LinkError("%s: not a MIPS R4000 object (machine 0x%x)" %
+                            (self.path, machine))
+        strtab_off = symptr + nsym * 18
+        strtab = data[strtab_off:] if symptr else b""
+
+        def longname(raw):
+            if raw[0:1] == b"/":
+                off = int(raw[1:].rstrip(b"\0") or b"0")
+                return cstr(strtab[off:])
+            return cstr(raw)
+
+        shoff = 20 + opthdr
+        for i in range(nsec):
+            (raw, _vs, _va, rawsize, rawptr, relptr, _ln, nrel, _nln, flags) = \
+                struct.unpack_from("<8sIIIIIIHHI", data, shoff + 40 * i)
+            name = longname(raw)
+            if flags & SCN_CNT_UNINIT:
+                body = None
+            else:
+                body = data[rawptr:rawptr + rawsize]
+            relocs = []
+            for r in range(nrel):
+                off, sym, typ = struct.unpack_from("<IIH", data, relptr + 10 * r)
+                relocs.append((off, sym, typ))
+            self.sections[i + 1] = InSection(self, i + 1, name, flags, body,
+                                             relocs, rawsize)
+
+        i = 0
+        while i < nsym:
+            raw = data[symptr + 18 * i: symptr + 18 * i + 8]
+            value, secnum, _typ, cls, naux = struct.unpack_from(
+                "<IhHBB", data, symptr + 18 * i + 8)
+            if raw[:4] == b"\0\0\0\0":
+                off = struct.unpack_from("<I", raw, 4)[0]
+                name = cstr(strtab[off:])
+            else:
+                name = cstr(raw)
+            aux = data[symptr + 18 * (i + 1): symptr + 18 * (i + 1 + naux)]
+            self.symbols.append((name, value, secnum, cls, aux))
+            self.symbols.extend([None] * naux)
+            if cls == SYM_CLASS_STATIC and naux and secnum > 0 and value == 0:
+                sec = self.sections.get(secnum)
+                if sec is not None and sec.name == name and sec.flags & SCN_LNK_COMDAT:
+                    _len, _nr, _nl, _ck, num, sel = struct.unpack_from(
+                        "<IHHIHB", aux, 0)
+                    sec.comdat_sel = sel
+                    sec.assoc = num
+            i += 1 + naux
+
+        d = self.sections_named(".drectve")
+        for s in d:
+            self.drectve += s.data.decode("latin-1", "replace") + " "
+
+    def sections_named(self, name):
+        return [s for s in self.sections.values() if s.name == name]
+
+    def defined_externals(self):
+        for ent in self.symbols:
+            if ent is None:
+                continue
+            name, value, secnum, cls, _aux = ent
+            if cls == SYM_CLASS_EXTERNAL and (secnum != 0 or value != 0):
+                yield name
+
+
+def parse_short_import(path, data):
+    sig1, sig2, _ver, machine, _ts, _size, hint, typeinfo = struct.unpack_from(
+        "<HHHHIIHH", data, 0)
+    if machine not in (IMAGE_FILE_MACHINE_R4000, IMAGE_FILE_MACHINE_UNKNOWN):
+        raise LinkError("%s: import member for machine 0x%x" % (path, machine))
+    rest = data[20:]
+    sym = cstr(rest)
+    dll = cstr(rest[len(sym) + 1:])
+    imp_type = typeinfo & 3            # 0 code, 1 data, 2 const
+    name_type = (typeinfo >> 2) & 7    # 0 ordinal, 1 name, 2 noprefix, 3 undecorate
+    if name_type == 0:
+        imp = Import(dll, sym, hint, True)
+    else:
+        name = sym
+        if name_type in (2, 3):
+            name = name.lstrip("?@_")
+        if name_type == 3:
+            name = name.split("@", 1)[0]
+        imp = Import(dll, name, hint, False)
+    return sym, imp_type, imp
+
+
+class Archive:
+    """A .lib: maps symbol names to lazily loaded members."""
+
+    def __init__(self, path, data):
+        self.path = path
+        self.members = {}           # symbol -> member offset
+        self.loaded = set()
+        self.data = data
+        if data[:8] != b"!<arch>\n":
+            raise LinkError("%s: not an archive" % path)
+        longnames = b""
+        off = 8
+        while off + 60 <= len(data):
+            hdr = data[off:off + 60]
+            name = hdr[:16].decode("latin-1").rstrip()
+            size = int(hdr[48:58].decode("latin-1").strip())
+            body_off = off + 60
+            body = data[body_off:body_off + size]
+            if name == "//":
+                longnames = body
+            elif name not in ("/", ""):
+                self.index_member(body_off, body)
+            off = align(body_off + size, 2)
+
+    def index_member(self, off, body):
+        if len(body) >= 4 and struct.unpack_from("<HH", body, 0) == (0, 0xFFFF):
+            sym, imp_type, _imp = parse_short_import(self.path, body)
+            self.members.setdefault(sym, off)
+            self.members.setdefault("__imp_" + sym, off)
+            return
+        try:
+            obj = ObjFile(self.path, body)
+        except (LinkError, struct.error):
+            return
+        for name in obj.defined_externals():
+            self.members.setdefault(name, off)
+
+    def member_at(self, off):
+        hdr = self.data[off - 60:off]
+        size = int(hdr[48:58].decode("latin-1").strip())
+        return self.data[off:off + size]
+
+
+# ---------------------------------------------------------------------------
+# Linker
+# ---------------------------------------------------------------------------
+
+class OutSection:
+    def __init__(self, name, flags):
+        self.name = name
+        self.flags = flags
+        self.parts = []             # InSection list in layout order
+        self.extra = bytearray()    # synthesized content appended after parts
+        self.size = 0
+        self.rawsize = 0
+        self.rva = 0
+        self.fileoff = 0
+        self.data = None
+
+
+OUTPUT_ORDER = [".text", ".rdata", ".data", ".idata", ".rsrc"]
+CODE_FLAGS = SCN_CNT_CODE | SCN_MEM_EXECUTE | SCN_MEM_READ
+RDATA_FLAGS = SCN_CNT_INIT | SCN_MEM_READ
+DATA_FLAGS = SCN_CNT_INIT | SCN_MEM_READ | SCN_MEM_WRITE
+
+
+class Linker:
+    def __init__(self, args):
+        self.args = args
+        self.symbols = {}
+        self.objects = []
+        self.archives = []
+        self.imports = {}           # (dll, sym) -> Import
+        self.base = args.base
+
+    def sym(self, name):
+        s = self.symbols.get(name)
+        if s is None:
+            s = self.symbols[name] = Symbol(name)
+        return s
+
+    # -- input loading ----------------------------------------------------
+
+    def find_lib(self, name):
+        cands = [name]
+        if not name.lower().endswith(".lib"):
+            cands.append(name + ".lib")
+        for c in cands:
+            if os.path.isfile(c):
+                return c
+            for d in self.args.libpath:
+                p = os.path.join(d, c)
+                if os.path.isfile(p):
+                    return p
+                # SDK file names are mixed case; match case-insensitively.
+                try:
+                    for f in os.listdir(d):
+                        if f.lower() == c.lower():
+                            return os.path.join(d, f)
+                except OSError:
+                    pass
+        raise LinkError("cannot find library %s" % name)
+
+    def add_input(self, path):
+        with open(path, "rb") as f:
+            data = f.read()
+        if data[:8] == b"!<arch>\n":
+            self.archives.append(Archive(path, data))
+        else:
+            self.add_object(ObjFile(path, data))
+
+    def add_object(self, obj):
+        self.objects.append(obj)
+        for i, ent in enumerate(obj.symbols):
+            if ent is None:
+                continue
+            name, value, secnum, cls, aux = ent
+            if cls == SYM_CLASS_WEAK_EXTERNAL:
+                s = self.sym(name)
+                tag = struct.unpack_from("<I", aux, 0)[0]
+                s.weak_default = obj.symbols[tag][0]
+                continue
+            if cls != SYM_CLASS_EXTERNAL:
+                continue
+            s = self.sym(name)
+            if secnum == 0:
+                if value:
+                    s.common = max(s.common, value)
+                continue
+            if secnum == -1:
+                self.define(s, obj, absolute=value)
+                continue
+            if secnum < 0:
+                continue
+            sec = obj.sections[secnum]
+            if s.section is not None:
+                if sec.flags & SCN_LNK_COMDAT and s.section.flags & SCN_LNK_COMDAT:
+                    sec.live = False
+                    continue
+                raise LinkError("duplicate symbol %s in %s and %s" %
+                                (name, s.section.obj.path, obj.path))
+            if s.absolute is not None or s.imp or s.thunk:
+                raise LinkError("duplicate symbol %s in %s" % (name, obj.path))
+            s.section = sec
+            s.value = value
+            s.common = 0
+
+    def define(self, s, obj, absolute):
+        if s.defined() and not s.common:
+            raise LinkError("duplicate symbol %s in %s" % (s.name, obj.path))
+        s.absolute = absolute
+        s.common = 0
+
+    def add_import_member(self, path, body):
+        sym, imp_type, imp = parse_short_import(path, body)
+        key = (imp.dll.lower(), imp.name if not imp.by_ordinal else "#%d" % imp.ordinal)
+        imp = self.imports.setdefault(key, imp)
+        isym = self.sym("__imp_" + sym)
+        if not isym.defined():
+            isym.imp = imp
+        if imp_type == 0:
+            tsym = self.sym(sym)
+            if not tsym.defined():
+                tsym.thunk = imp
+                imp.need_thunk = True
+
+    def undefined(self):
+        return [s for s in self.symbols.values() if not s.defined()]
+
+    def resolve(self):
+        progress = True
+        while progress:
+            progress = False
+            for s in self.undefined():
+                for ar in self.archives:
+                    off = ar.members.get(s.name)
+                    if off is None or off in ar.loaded:
+                        continue
+                    ar.loaded.add(off)
+                    body = ar.member_at(off)
+                    if struct.unpack_from("<HH", body, 0) == (0, 0xFFFF):
+                        self.add_import_member(ar.path, body)
+                    else:
+                        self.add_object(ObjFile("%s(%x)" % (ar.path, off), body))
+                    progress = True
+                    break
+        missing = []
+        for s in self.undefined():
+            if s.weak_default and self.sym(s.weak_default).defined():
+                continue
+            missing.append(s.name)
+        if missing:
+            raise LinkError("undefined symbols:\n  " + "\n  ".join(sorted(missing)))
+
+    # -- layout -----------------------------------------------------------
+
+    def out_name(self, sec):
+        base = sec.name.split("$", 1)[0]
+        if sec.flags & SCN_CNT_UNINIT or base == ".bss":
+            return ".bss"
+        if base.startswith(".text") or sec.flags & SCN_CNT_CODE:
+            return ".text"
+        if base in (".rdata", ".xdata", ".pdata", ".rodata"):
+            return ".rdata"
+        if base == ".data" or sec.flags & SCN_MEM_WRITE:
+            return ".data"
+        return ".rdata"
+
+    def discard(self, sec):
+        if not sec.live:
+            return True
+        if sec.flags & (SCN_LNK_REMOVE | SCN_LNK_INFO):
+            return True
+        if sec.name.startswith(".debug") or sec.name.startswith(".llvm"):
+            return True
+        if sec.name == ".drectve":
+            return True
+        return False
+
+    def layout(self):
+        # Associative COMDATs die with their parent.
+        for obj in self.objects:
+            for sec in obj.sections.values():
+                if sec.comdat_sel == 5 and sec.assoc and not obj.sections[sec.assoc].live:
+                    sec.live = False
+
+        outs = {}
+        bss = []
+
+        def out(name, flags):
+            o = outs.get(name)
+            if o is None:
+                o = outs[name] = OutSection(name, flags)
+            return o
+
+        out(".text", CODE_FLAGS)
+        groups = {}
+        for obj in self.objects:
+            for idx in sorted(obj.sections):
+                sec = obj.sections[idx]
+                if self.discard(sec):
+                    continue
+                name = self.out_name(sec)
+                if name == ".bss":
+                    bss.append(sec)
+                    continue
+                suffix = sec.name.split("$", 1)[1] if "$" in sec.name else ""
+                groups.setdefault(name, []).append((suffix, len(groups.get(name, [])), sec))
+
+        flags_for = {".text": CODE_FLAGS, ".rdata": RDATA_FLAGS, ".data": DATA_FLAGS}
+        for name, items in groups.items():
+            o = out(name, flags_for[name])
+            items.sort(key=lambda t: (t[0], t[1]))
+            o.parts = [t[2] for t in items]
+
+        # COMMON symbols become .bss space.
+        commons = sorted((s for s in self.symbols.values()
+                          if s.common and s.section is None and s.absolute is None),
+                         key=lambda s: s.name)
+        self.bss_parts = bss
+        self.commons = commons
+        if bss or commons:
+            out(".data", DATA_FLAGS)
+
+        # Thunks for imported code symbols live at the end of .text.
+        self.thunk_imports = sorted((i for i in self.imports.values() if i.need_thunk),
+                                    key=lambda i: (i.dll.lower(), i.ordinal, i.name))
+
+        self.outs = outs
+
+    def place(self):
+        rva = SECTION_ALIGN
+        order = [n for n in OUTPUT_ORDER if n in self.outs or n in (".idata", ".rsrc")]
+        self.order = []
+        for name in order:
+            if name == ".idata":
+                if not self.imports:
+                    continue
+                o = self.outs.setdefault(".idata", OutSection(".idata", DATA_FLAGS))
+            elif name == ".rsrc":
+                if not self.args.res:
+                    continue
+                o = self.outs.setdefault(".rsrc", OutSection(".rsrc", RDATA_FLAGS))
+            else:
+                o = self.outs[name]
+            o.rva = rva
+            off = 0
+            for sec in o.parts:
+                off = align(off, sec.alignment)
+                sec.out = o
+                sec.offset = off
+                off += sec.size
+            if name == ".text":
+                off = align(off, 4)
+                self.thunk_base = off
+                for imp in self.thunk_imports:
+                    imp.thunk_rva = rva + off
+                    off += 16
+            if name == ".idata":
+                off = self.build_idata(rva)
+            if name == ".rsrc":
+                off = self.build_rsrc(rva)
+            o.rawsize_used = off
+            if name == ".data":
+                # Uninitialized data follows .data as virtual-only space.
+                for sec in self.bss_parts:
+                    off = align(off, sec.alignment)
+                    sec.out = o
+                    sec.offset = off
+                    off += sec.size
+                for s in self.commons:
+                    a = 8 if s.common >= 8 else 4
+                    off = align(off, a)
+                    s.bss_rva = rva + off
+                    off += s.common
+            o.size = off
+            if off == 0:
+                continue
+            self.order.append(o)
+            rva = align(rva + max(off, 1), SECTION_ALIGN)
+        self.image_size = rva
+
+    # -- imports ----------------------------------------------------------
+
+    def build_idata(self, rva):
+        dlls = {}
+        for imp in self.imports.values():
+            dlls.setdefault(imp.dll.lower(), (imp.dll, []))[1].append(imp)
+        dll_list = sorted(dlls.values(), key=lambda t: t[0].lower())
+        for _name, imps in dll_list:
+            imps.sort(key=lambda i: (i.by_ordinal, i.ordinal, i.name))
+
+        buf = bytearray()
+        desc_size = 20 * (len(dll_list) + 1)
+        buf += b"\0" * desc_size
+        ilt_offs, iat_offs = [], []
+        for _name, imps in dll_list:
+            ilt_offs.append(len(buf))
+            buf += b"\0" * (4 * (len(imps) + 1))
+        self.iat_start = len(buf)
+        for _name, imps in dll_list:
+            iat_offs.append(len(buf))
+            buf += b"\0" * (4 * (len(imps) + 1))
+        self.iat_size = len(buf) - self.iat_start
+        name_offs = []
+        for dll, imps in dll_list:
+            entries = []
+            for imp in imps:
+                if imp.by_ordinal:
+                    entries.append(0x80000000 | imp.ordinal)
+                else:
+                    if len(buf) & 1:
+                        buf += b"\0"
+                    entries.append(rva + len(buf))
+                    buf += struct.pack("<H", imp.ordinal) + imp.name.encode("latin-1") + b"\0"
+            name_offs.append(entries)
+        dll_name_offs = []
+        for dll, _imps in dll_list:
+            dll_name_offs.append(len(buf))
+            buf += dll.encode("latin-1") + b"\0"
+        for d, (dll, imps) in enumerate(dll_list):
+            struct.pack_into("<IIIII", buf, 20 * d, rva + ilt_offs[d], 0, 0,
+                             rva + dll_name_offs[d], rva + iat_offs[d])
+            for k, imp in enumerate(imps):
+                struct.pack_into("<I", buf, ilt_offs[d] + 4 * k, name_offs[d][k])
+                struct.pack_into("<I", buf, iat_offs[d] + 4 * k, name_offs[d][k])
+                imp.iat_rva = rva + iat_offs[d] + 4 * k
+        self.idata_bytes = buf
+        self.import_dir = (rva, desc_size)
+        self.iat_dir = (rva + self.iat_start, self.iat_size)
+        return len(buf)
+
+    # -- resources --------------------------------------------------------
+
+    def build_rsrc(self, rva):
+        with open(self.args.res, "rb") as f:
+            data = f.read()
+        entries = []
+        off = 0
+        while off + 8 <= len(data):
+            size, hsize = struct.unpack_from("<II", data, off)
+            hdr = data[off + 8: off + hsize]
+            body = data[off + hsize: off + hsize + size]
+            p = 0
+
+            def name_or_id(p):
+                if struct.unpack_from("<H", hdr, p)[0] == 0xFFFF:
+                    return struct.unpack_from("<H", hdr, p + 2)[0], p + 4
+                end = p
+                while struct.unpack_from("<H", hdr, end)[0] != 0:
+                    end += 2
+                return hdr[p:end].decode("utf-16-le"), end + 2
+
+            rtype, p = name_or_id(0)
+            rname, p = name_or_id(p)
+            p = align(p, 4)
+            _dver, _mflags, lang, _ver, _ch = struct.unpack_from("<IHHII", hdr, p)
+            if not (rtype == 0 and rname == 0 and size == 0):
+                entries.append((rtype, rname, lang, body))
+            off = align(off + hsize + size, 4)
+
+        def key(k):
+            # Named entries sort before IDs; names compare case-insensitively.
+            return (0, k.upper(), "") if isinstance(k, str) else (1, "", k)
+
+        tree = {}
+        for rtype, rname, lang, body in entries:
+            tree.setdefault(rtype, {}).setdefault(rname, {})[lang] = body
+
+        # Directory tables, then entries, then strings, then data.
+        dirs = bytearray()
+        strings = bytearray()
+        blobs = []
+        pending = []
+
+        def table(children):
+            pos = len(dirs)
+            items = sorted(children.items(), key=lambda kv: key(kv[0]))
+            named = sum(1 for k, _ in items if isinstance(k, str))
+            dirs.extend(struct.pack("<IIHHHH", 0, 0, 0, 0, named, len(items) - named))
+            slots = []
+            for k, v in items:
+                slots.append((len(dirs), k, v))
+                dirs.extend(b"\0" * 8)
+            return pos, slots
+
+        def emit(children, depth):
+            pos, slots = table(children)
+            for slot, k, v in slots:
+                pending.append((slot, k, v, depth))
+            return pos
+
+        root = emit(tree, 0)
+        i = 0
+        while i < len(pending):
+            slot, k, v, depth = pending[i]
+            if depth < 2:
+                child = emit(v, depth + 1)
+                pending[i] = (slot, k, ("dir", child), depth)
+            else:
+                pending[i] = (slot, k, ("data", v), depth)
+            i += 1
+
+        data_entries_off = len(dirs)
+        n_data = sum(1 for p in pending if p[2][0] == "data")
+        strings_off = data_entries_off + 16 * n_data
+        name_offsets = {}
+        for _slot, k, _v, _d in pending:
+            if isinstance(k, str) and k not in name_offsets:
+                name_offsets[k] = strings_off + len(strings)
+                enc = k.upper().encode("utf-16-le")
+                strings.extend(struct.pack("<H", len(enc) // 2) + enc)
+        blobs_off = align(strings_off + len(strings), 4)
+
+        out = bytearray(dirs)
+        out.extend(b"\0" * (blobs_off - len(out)))
+        de_index = 0
+        blob_cursor = blobs_off
+        blob_data = bytearray()
+        for slot, k, v, _d in pending:
+            if isinstance(k, str):
+                struct.pack_into("<I", out, slot, 0x80000000 | name_offsets[k])
+            else:
+                struct.pack_into("<I", out, slot, k)
+            if v[0] == "dir":
+                struct.pack_into("<I", out, slot + 4, 0x80000000 | v[1])
+            else:
+                de = data_entries_off + 16 * de_index
+                de_index += 1
+                struct.pack_into("<I", out, slot + 4, de)
+                body = v[1]
+                struct.pack_into("<IIII", out, de, rva + blob_cursor, len(body), 0, 0)
+                blob_data.extend(body)
+                pad = align(len(body), 4) - len(body)
+                blob_data.extend(b"\0" * pad)
+                blob_cursor += len(body) + pad
+        # Strings sit between data entries and blobs.
+        out[strings_off:strings_off + len(strings)] = strings
+        out.extend(blob_data)
+        assert root == 0
+        self.rsrc_bytes = out
+        self.rsrc_dir = (rva, len(out))
+        return len(out)
+
+    # -- relocation -------------------------------------------------------
+
+    def sym_rva(self, obj, idx):
+        ent = obj.symbols[idx]
+        if ent is None:
+            raise LinkError("%s: relocation against aux symbol" % obj.path)
+        name, value, secnum, cls, _aux = ent
+        if cls in (SYM_CLASS_EXTERNAL, SYM_CLASS_WEAK_EXTERNAL):
+            s = self.symbols[name]
+            if not s.defined() and s.weak_default:
+                s = self.symbols[s.weak_default]
+            return self.global_rva(s)
+        if secnum == -1:
+            return value - self.base
+        if secnum <= 0:
+            raise LinkError("%s: relocation against undefined local %s" % (obj.path, name))
+        sec = obj.sections[secnum]
+        if sec.out is None:
+            raise LinkError("%s: relocation against discarded section %s" %
+                            (obj.path, sec.name))
+        return sec.rva() + value
+
+    def global_rva(self, s):
+        if s.section is not None:
+            if s.section.out is None:
+                raise LinkError("symbol %s is in a discarded section" % s.name)
+            return s.section.rva() + s.value
+        if s.absolute is not None:
+            return s.absolute - self.base
+        if s.common:
+            return s.bss_rva
+        if s.imp is not None:
+            return s.imp.iat_rva
+        if s.thunk is not None:
+            return s.thunk.thunk_rva
+        raise LinkError("undefined symbol %s" % s.name)
+
+    def apply_relocs(self, sec, buf):
+        obj = sec.obj
+        relocs = sec.relocs
+        i = 0
+        while i < len(relocs):
+            off, idx, typ = relocs[i]
+            i += 1
+            if typ == R_ABSOLUTE or typ == R_PAIR:
+                continue
+            S_rva = self.sym_rva(obj, idx)
+            S = self.base + S_rva
+            P = sec.rva() + off
+            if typ == R_REFWORD:
+                v = struct.unpack_from("<I", buf, off)[0]
+                struct.pack_into("<I", buf, off, (v + S) & 0xFFFFFFFF)
+            elif typ == R_REFWORDNB:
+                v = struct.unpack_from("<I", buf, off)[0]
+                struct.pack_into("<I", buf, off, (v + S_rva) & 0xFFFFFFFF)
+            elif typ == R_JMPADDR:
+                insn = struct.unpack_from("<I", buf, off)[0]
+                target = S + ((insn & 0x03FFFFFF) << 2)
+                here = self.base + P
+                if (target & 0xF0000000) != ((here + 4) & 0xF0000000):
+                    raise LinkError("JMPADDR out of range in %s" % obj.path)
+                insn = (insn & 0xFC000000) | ((target >> 2) & 0x03FFFFFF)
+                struct.pack_into("<I", buf, off, insn)
+            elif typ == R_REFHI:
+                if i >= len(relocs) or relocs[i][2] != R_PAIR:
+                    raise LinkError("%s: REFHI without PAIR" % obj.path)
+                lo = relocs[i][1] & 0xFFFF
+                lo = lo - 0x10000 if lo & 0x8000 else lo
+                i += 1
+                insn = struct.unpack_from("<I", buf, off)[0]
+                val = S + ((insn & 0xFFFF) << 16) + lo
+                hi = ((val + 0x8000) >> 16) & 0xFFFF
+                struct.pack_into("<I", buf, off, (insn & 0xFFFF0000) | hi)
+            elif typ == R_REFLO:
+                insn = struct.unpack_from("<I", buf, off)[0]
+                lo = (insn + S) & 0xFFFF
+                struct.pack_into("<I", buf, off, (insn & 0xFFFF0000) | lo)
+            elif typ == R_REFHALF:
+                v = struct.unpack_from("<H", buf, off)[0]
+                val = S + (v << 16)
+                struct.pack_into("<H", buf, off, ((val + 0x8000) >> 16) & 0xFFFF)
+            elif typ == R_SECTION:
+                out_idx = self.order.index(self.section_of(obj, idx)) + 1
+                struct.pack_into("<H", buf, off, out_idx)
+            elif typ == R_SECREL:
+                v = struct.unpack_from("<I", buf, off)[0]
+                o = self.section_of(obj, idx)
+                struct.pack_into("<I", buf, off, (v + S_rva - o.rva) & 0xFFFFFFFF)
+            elif typ in (R_GPREL, R_LITERAL):
+                raise LinkError("%s: GP-relative relocation; compile with -G0" % obj.path)
+            else:
+                raise LinkError("%s: unsupported MIPS relocation 0x%x in %s" %
+                                (obj.path, typ, sec.name))
+
+    def section_of(self, obj, idx):
+        name, _v, secnum, cls, _aux = obj.symbols[idx]
+        if cls == SYM_CLASS_EXTERNAL:
+            s = self.symbols[name]
+            if s.section is None:
+                raise LinkError("SECTION/SECREL against non-section symbol %s" % name)
+            return s.section.out
+        return obj.sections[secnum].out
+
+    # -- output -----------------------------------------------------------
+
+    def build_sections(self):
+        for o in self.order:
+            buf = bytearray(o.rawsize_used)
+            for sec in o.parts:
+                if sec.data is not None:
+                    body = bytearray(sec.data)
+                    self.apply_relocs(sec, body)
+                    buf[sec.offset:sec.offset + len(body)] = body
+            if o.name == ".text":
+                for imp in self.thunk_imports:
+                    iat = self.base + imp.iat_rva
+                    hi = ((iat + 0x8000) >> 16) & 0xFFFF
+                    lo = iat & 0xFFFF
+                    t = imp.thunk_rva - o.rva
+                    struct.pack_into("<IIII", buf, t,
+                                     0x3C080000 | hi,   # lui  t0, hi(__imp)
+                                     0x8D080000 | lo,   # lw   t0, lo(__imp)(t0)
+                                     0x01000008,        # jr   t0
+                                     0x00000000)        # nop
+            if o.name == ".idata":
+                buf[:] = self.idata_bytes
+            if o.name == ".rsrc":
+                buf[:] = self.rsrc_bytes
+            o.data = bytes(buf)
+
+    def write(self, path):
+        entry = self.symbols.get(self.args.entry)
+        if entry is None or not entry.defined():
+            raise LinkError("entry point %s not defined" % self.args.entry)
+        entry_rva = self.global_rva(entry)
+
+        nsec = len(self.order)
+        headers_size = align(0x80 + 4 + 20 + 224 + 40 * nsec, FILE_ALIGN)
+        fileoff = headers_size
+        for o in self.order:
+            o.rawsize = align(len(o.data), FILE_ALIGN)
+            o.fileoff = fileoff if o.rawsize else 0
+            fileoff += o.rawsize
+
+        out = bytearray(fileoff)
+        # DOS header with e_lfanew = 0x80
+        struct.pack_into("<2s", out, 0, b"MZ")
+        struct.pack_into("<HHHHH", out, 2, 0x90, 3, 0, 4, 0)
+        struct.pack_into("<HH", out, 0x10, 0xFFFF, 0)
+        struct.pack_into("<H", out, 0x18, 0x40)
+        struct.pack_into("<I", out, 0x3C, 0x80)
+        pe = 0x80
+        out[pe:pe + 4] = b"PE\0\0"
+        chars = 0x0001 | 0x0002 | 0x0004 | 0x0008 | 0x0100
+        struct.pack_into("<HHIIIHH", out, pe + 4, IMAGE_FILE_MACHINE_R4000, nsec,
+                         0, 0, 0, 224, chars)
+
+        size_code = sum(o.rawsize for o in self.order if o.flags & SCN_CNT_CODE)
+        size_init = sum(o.rawsize for o in self.order if o.flags & SCN_CNT_INIT)
+        size_uninit = sum(o.size - len(o.data) for o in self.order
+                          if o.size > len(o.data))
+        text = self.outs.get(".text")
+        data_secs = [o for o in self.order if not o.flags & SCN_CNT_CODE]
+        base_of_data = data_secs[0].rva if data_secs else 0
+
+        oh = pe + 24
+        maj_ss, min_ss = self.args.subsystem_version
+        struct.pack_into(
+            "<HBBIIIIIIIIIHHHHHHIIIIHHIIIIII", out, oh,
+            0x10B, 6, 20, size_code, size_init, size_uninit,
+            entry_rva, text.rva if text else 0, base_of_data,
+            self.base, SECTION_ALIGN, FILE_ALIGN,
+            4, 0,                   # OS version (what LINK.EXE writes for CE)
+            0, 0,                   # image version
+            maj_ss, min_ss,
+            0,                      # Win32VersionValue
+            self.image_size, headers_size, 0,
+            9,                      # IMAGE_SUBSYSTEM_WINDOWS_CE_GUI
+            0,                      # DllCharacteristics
+            self.args.stack[0], self.args.stack[1],
+            0x100000, 0x1000,
+            0, 16)
+        dd = oh + 96
+        if self.imports:
+            struct.pack_into("<II", out, dd + 8 * 1, *self.import_dir)
+            struct.pack_into("<II", out, dd + 8 * 12, *self.iat_dir)
+        if self.args.res:
+            struct.pack_into("<II", out, dd + 8 * 2, *self.rsrc_dir)
+
+        sh = oh + 224
+        for k, o in enumerate(self.order):
+            flags = o.flags
+            if o.name == ".data" and o.size > len(o.data):
+                flags |= SCN_CNT_UNINIT if not o.data else 0
+            struct.pack_into("<8sIIIIIIHHI", out, sh + 40 * k,
+                             o.name.encode("latin-1"), o.size, o.rva,
+                             o.rawsize, o.fileoff, 0, 0, 0, 0, flags)
+            if o.rawsize:
+                out[o.fileoff:o.fileoff + len(o.data)] = o.data
+
+        with open(path, "wb") as f:
+            f.write(out)
+
+    def write_map(self, path):
+        rows = []
+        for s in self.symbols.values():
+            try:
+                rows.append((self.base + self.global_rva(s), s.name))
+            except LinkError:
+                pass
+        with open(path, "w") as f:
+            for o in self.order:
+                f.write("%-8s %08x %08x\n" % (o.name, self.base + o.rva, o.size))
+            f.write("\n")
+            for addr, name in sorted(rows):
+                f.write("%08x %s\n" % (addr, name))
+
+    def run(self):
+        for p in self.args.inputs:
+            self.add_input(p)
+        for lib in self.args.libs:
+            self.add_input(self.find_lib(lib))
+        self.sym(self.args.entry)
+        self.resolve()
+        self.layout()
+        self.place()
+        self.build_sections()
+        self.write(self.args.output)
+        if self.args.map:
+            self.write_map(self.args.map)
+
+
+def parse_pair(s, conv=lambda x: int(x, 0)):
+    parts = s.split(",")
+    if len(parts) == 1:
+        parts.append("0x1000")
+    return conv(parts[0]), conv(parts[1])
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    ap.add_argument("inputs", nargs="*", help="objects and .lib archives")
+    ap.add_argument("-o", "--output", required=True)
+    ap.add_argument("-L", dest="libpath", action="append", default=[],
+                    help="library search directory")
+    ap.add_argument("-l", dest="libs", action="append", default=[],
+                    help="library to link (searched in -L dirs)")
+    ap.add_argument("--entry", default="WinMainCRTStartup")
+    ap.add_argument("--base", type=lambda x: int(x, 0), default=0x10000)
+    ap.add_argument("--stack", type=parse_pair, default=(0x10000, 0x1000),
+                    help="reserve[,commit] (default 0x10000,0x1000)")
+    ap.add_argument("--subsystem-version", type=lambda s: tuple(int(x) for x in s.split(".")),
+                    default=(3, 0))
+    ap.add_argument("--res", help="compiled resource (.res) file")
+    ap.add_argument("--map", help="write a symbol map")
+    args = ap.parse_args()
+    try:
+        Linker(args).run()
+    except LinkError as e:
+        sys.stderr.write("be300-ld: error: %s\n" % e)
+        try:
+            os.unlink(args.output)
+        except OSError:
+            pass
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
