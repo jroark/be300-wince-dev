@@ -94,7 +94,7 @@ These targets never modify the base NAND image; they boot a copy in `build/`. Wh
 
 | Tool | What it does |
 | --- | --- |
-| `tools/be300-cc` | Runs clang with `--target=mipsel-windows-msvc -march=mips2 -msoft-float -G0` and the SDK defines. Headers are searched in this order: Casio SDK, clang builtins (`stddef.h`, `stdint.h`, `stdbool.h`), then the H/PC fallback. |
+| `tools/be300-cc` | Runs clang with `--target=mipsel-windows-msvc -march=mips2 -msoft-float -G0` and the SDK defines. Headers are searched in this order: Casio SDK, clang builtins (`stddef.h`, `stdint.h`, `stdbool.h`), then the H/PC fallback. It force-includes `tools/include/be300-fixups.h`, which replaces the SDK's `va_start` (it assumes Microsoft's compiler homes register arguments, which clang doesn't). |
 | `tools/be300-ld` | MIPS PE linker for clang's COFF objects, `.lib` archives, import libs and `.res` files. Output uses base 0x10000 and subsystem `WINDOWS_CE_GUI` 3.00, with relocations stripped, the same layout as eVC3's LINK.EXE. `--map` writes a symbol map. (lld-link can read MIPS COFF but can't apply MIPS relocations, so it can't be used.) |
 | `tools/mkcbea.py` | Builds `.cbea` install packages in the same format as Casio's MkArch: repacking Casio's REQ.cbea reproduces it byte for byte. `--reg` adds registry values and `--autostart LaunchNN` adds an `HKLM\Init` boot launch. |
 | `tools/mkcf.sh` | Builds a CF image with `\CE\R4100\AutoRun.exe`. |

@@ -62,6 +62,32 @@ static int add1(int x) { return x + 1; }
 static int dbl(int x) { return x * 2; }
 static int (*const g_ops[])(int) = { add1, dbl };
 
+/* A variadic function of our own: va_start must find the register arguments
+ * clang spilled (tools/include/be300-fixups.h). */
+static long long vsum(int n, ...)
+{
+    va_list ap;
+    long long t = 0;
+    int i;
+
+    va_start(ap, n);
+    for (i = 0; i < n; i++)
+        t += i == 3 ? va_arg(ap, long long) : va_arg(ap, int);
+    va_end(ap);
+    return t;
+}
+
+static int vfmt(WCHAR *buf, const WCHAR *fmt, ...)
+{
+    va_list ap;
+    int n;
+
+    va_start(ap, fmt);
+    n = wvsprintfW(buf, fmt, ap);
+    va_end(ap);
+    return n;
+}
+
 static struct big make_big(int seed)
 {
     struct big b;
@@ -124,6 +150,10 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmd, int show)
     check(L"data init", g_data[0] + g_data[3], 55);
     b = make_big(5);
     check(L"struct copy", b.v[0] + b.v[39], 49);
+
+    check(L"varargs", vsum(5, 1, 20, 300, 4000000000000LL, 50000), 4000000050321LL);
+    vfmt(line, L"%d-%s-%u", 7, L"ok", 9u);
+    check(L"varargs fmt", lstrcmpW(line, L"7-ok-9"), 0);
 
     wsprintfW(line, L"SELFTEST END pass=%d fail=%d\r\n", g_pass, g_fail);
     out(line);
