@@ -19,6 +19,8 @@ extra=()
 # MIPS16SUPPORT selects kfuncs.h's __emit-based DebugBreak declaration;
 # its default branch declares `__asm` as a function, which clang rejects.
 # DebugBreak itself comes from rt/debugbreak.c.
+# tools/include/be300-fixups.h replaces the SDK's va_start, which doesn't work
+# under clang.
 exec "$llvm/clang" \
     --target=mipsel-windows-msvc -march=mips2 -msoft-float \
     -mno-abicalls -fno-pic -G0 \
@@ -27,4 +29,5 @@ exec "$llvm/clang" \
     -D_WIN32_WCE=300 -DUNDER_CE=300 -DWCE_PLATFORM_CASIO_BE300 \
     -DMIPS -D_MIPS_ -DMIPS16SUPPORT -DUNICODE -D_UNICODE \
     -Wno-ignored-pragma-intrinsic -Wno-pragma-pack -Wno-microsoft-anon-tag \
+    -include "$root/tools/include/be300-fixups.h" \
     "$@"
